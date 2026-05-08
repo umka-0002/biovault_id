@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Get Dependencies and Run Tests",
+			"type": "shell",
+			"command": "flutter pub get && flutter test test/fuzzy_extractor_service_test.dart"
+		}
+	]
+}
