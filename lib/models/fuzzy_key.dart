@@ -24,6 +24,11 @@ class EnrollmentMetadata {
         'additionalData': additionalData,
       };
 
+  String toBase64() {
+    final jsonStr = jsonEncode(toJson());
+    return base64Encode(utf8.encode(jsonStr));
+  }
+
   factory EnrollmentMetadata.fromJson(Map<String, dynamic> json) =>
       EnrollmentMetadata(
         enrollmentTime: DateTime.parse(json['enrollmentTime'] as String),

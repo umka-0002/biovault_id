@@ -11,13 +11,24 @@ class IpfsService {
   String gatewayUrl;
   static const int _ivSize = 12;
   static const int _tagSize = 128;
+  
+  bool _isTestMode = false;
+  final Map<String, Uint8List> _mockIpfs = {};
 
-  IpfsService({String? gatewayUrl, Dio? dio})
+  IpfsService({String? gatewayUrl, Dio? dio, bool testMode = true})
       : gatewayUrl = gatewayUrl ?? 'https://ipfs.io',
-        _dio = dio ?? Dio();
+        _dio = dio ?? Dio(),
+        _isTestMode = testMode;
 
   /// Загружает зашифрованные данные в IPFS и возвращает CID.
   Future<String> uploadEncryptedData(Uint8List payload) async {
+    if (_isTestMode) {
+      final mockHash = "Qm" + sha256.convert(payload).toString().substring(0, 44);
+      _mockIpfs[mockHash] = payload;
+      print("Mock IPFS: Uploaded data with CID $mockHash");
+      return mockHash;
+    }
+    
     final formData = FormData.fromMap({
       'file': MultipartFile.fromBytes(payload, filename: 'payload.bin'),
     });
@@ -33,6 +44,12 @@ class IpfsService {
 
   /// Загружает данные из IPFS по CID.
   Future<Uint8List> downloadData(String cid) async {
+    if (_isTestMode) {
+      if (_mockIpfs.containsKey(cid)) {
+        return _mockIpfs[cid]!;
+      }
+      throw Exception("CID $cid not found in mock storage");
+    }
     final url = '$gatewayUrl/ipfs/$cid';
     final response = await _dio.get<List<int>>(url,
         options: Options(responseType: ResponseType.bytes));
