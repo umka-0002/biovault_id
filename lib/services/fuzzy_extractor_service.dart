@@ -1,17 +1,23 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
 import '../models/fuzzy_key.dart';
+import '../utils/reed_solomon.dart';
 
 class FuzzyExtractorService {
-  static const int EMBEDDING_SIZE = 128;
-  static const double _maxDistanceForVerification = 5.0;
+  static const int embeddingSize = 128;
+  static const int paritySize = 127;
+  static const double _maxDistanceForVerification = 12.0;
+
+  final ReedSolomon _reedSolomon =
+      ReedSolomon(dataShards: embeddingSize, parityShards: paritySize);
 
   Future<FuzzyKey> enroll(List<double> embedding) async {
-    if (embedding.length != EMBEDDING_SIZE) {
-      throw ArgumentError('Embedding должен быть размером $EMBEDDING_SIZE');
+    if (embedding.length != embeddingSize) {
+      throw ArgumentError('Embedding должен быть размером $embeddingSize');
     }
 
     final quantized = _quantizeEmbedding(embedding);
@@ -21,6 +27,7 @@ class FuzzyExtractorService {
       enrollmentTime: DateTime.now(),
       framesCount: 1,
       averageQuality: _calculateEmbeddingQuality(embedding),
+      algorithmVersion: 'ReedSolomon-v1',
     );
 
     return FuzzyKey(
@@ -35,42 +42,51 @@ class FuzzyExtractorService {
     List<double> newEmbedding,
     String publicSyndrome,
   ) async {
-    if (newEmbedding.length != EMBEDDING_SIZE) {
-      throw ArgumentError('Embedding должен быть размером $EMBEDDING_SIZE');
+    if (newEmbedding.length != embeddingSize) {
+      throw ArgumentError('Embedding должен быть размером $embeddingSize');
     }
 
     final startTime = DateTime.now();
     final quantized = _quantizeEmbedding(newEmbedding);
-    final originalQuantized = publicSyndrome.split(',').map(int.parse).toList();
-    final embeddingDistance =
-        _calculateEmbeddingDistance(newEmbedding, originalQuantized);
-    final verificationTimeMs =
-        DateTime.now().difference(startTime).inMilliseconds;
+    final parityBytes = _decodeSyndrome(publicSyndrome);
+    final codeword = <int>[...quantized]..addAll(parityBytes);
 
-    if (embeddingDistance > _maxDistanceForVerification) {
+    int correctedErrors = 0;
+    List<int> recoveredMessage;
+    try {
+      recoveredMessage = _reedSolomon.decode(codeword);
+      correctedErrors = _estimateErrorCount(quantized, recoveredMessage);
+    } catch (error) {
       return VerificationResult(
         success: false,
         correctedErrors: 0,
-        embeddingDistance: embeddingDistance,
-        verificationTimeMs: verificationTimeMs,
-        errorMessage:
-            'Лицо не распознано: расстояние между embeddings слишком велико ($embeddingDistance > $_maxDistanceForVerification)',
+        embeddingDistance: _calculateEmbeddingDistance(newEmbedding, quantized),
+        verificationTimeMs:
+            DateTime.now().difference(startTime).inMilliseconds,
+        errorMessage: 'Не удалось восстановить embedding: $error',
       );
     }
 
-    final recoveredKey = _buildPrivateKey(originalQuantized);
-    final correctedErrors = (_estimateErrorCount(quantized, originalQuantized));
+    final recoveredKey = _buildPrivateKey(recoveredMessage);
+    final distance = _calculateEmbeddingDistance(newEmbedding, recoveredMessage);
+    final verificationTimeMs = DateTime.now().difference(startTime).inMilliseconds;
 
     return VerificationResult(
       success: true,
       recoveredKey: recoveredKey,
       correctedErrors: correctedErrors,
-      embeddingDistance: embeddingDistance,
+      embeddingDistance: distance,
       verificationTimeMs: verificationTimeMs,
     );
   }
 
-  String _buildSyndrome(List<int> quantized) => quantized.join(',');
+  String _buildSyndrome(List<int> quantized) {
+    return base64Encode(Uint8List.fromList(_reedSolomon.encode(quantized)));
+  }
+
+  List<int> _decodeSyndrome(String syndrome) {
+    return base64Decode(syndrome);
+  }
 
   String _buildPrivateKey(List<int> quantized) {
     final bytes = utf8.encode(quantized.join(','));
