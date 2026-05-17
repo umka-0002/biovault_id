@@ -306,15 +306,20 @@ class _CameraScreenState extends State<CameraScreen> {
       if (result.success) {
         await _blockchainService.verifyBio(userData['syndrome']);
         
+        // Final calibration check: Distance < 0.8 is usually an excellent match
+        String matchQuality = result.embeddingDistance < 0.8 ? "High" : "Medium";
+
         _showResultDialog(
           title: 'Verification Success',
           content: 'Identity confirmed via Blockchain.\n\n'
+                   'Match Quality: $matchQuality\n'
                    'Confidence (Distance): ${result.embeddingDistance.toStringAsFixed(3)}\n'
-                   'Corrected Errors: ${result.correctedErrors}',
+                   'Corrected Errors: ${result.correctedErrors}/127 per chunk',
         );
       } else {
         _showError('Verification failed: Face mismatch\n'
-                   'Distance: ${result.embeddingDistance.toStringAsFixed(3)}');
+                   'Distance: ${result.embeddingDistance.toStringAsFixed(3)}\n'
+                   'Hint: Try better lighting or center your face.');
       }
     } catch (e) {
       _showError('Verification failed: $e');

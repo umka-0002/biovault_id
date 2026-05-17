@@ -140,28 +140,32 @@ class FuzzyExtractorService {
   List<int> _quantizeEmbedding(List<double> embedding) {
     final result = <int>[];
     for (final value in embedding) {
-      // High-precision quantization for L2 vectors
-      // FaceNet components are small. We scale them by 5x to use the range better.
-      // Range [-0.2, 0.2] maps to [0, 255]
-      final scaled = (value * 5.0); 
+      // Balanced Quantization for L2 FaceNet-512 vectors.
+      // L2 vectors have components mostly in [-0.2, 0.2].
+      // We use a gain of 7.0 to spread these values across the 0-255 byte range.
+      // Formula: ((value * Gain) + 1.0) * 127.5
+      // This increases sensitivity to facial details while allowing RS to correct noise.
+      final scaled = value * 7.0; 
       final quantized = ((scaled + 1.0) * 127.5).round().clamp(0, 255);
       result.add(quantized);
     }
     return result;
   }
 
-  String _generatePrivateKey(Uint8List quantized) {
-    return sha256.convert(quantized).toString();
-  }
-
-  double _calculateDistance(List<double> embedding, Uint8List quantized) {
-    var sum = 0.0;
-    for (var i = 0; i < embedding.length; i++) {
-      final dequantized = (quantized[i] / 127.5) - 1.0;
-      final diff = embedding[i] - dequantized;
+  double _calculateDistance(List<double> e1, Uint8List e2Quantized) {
+    // To calculate real distance, we need to de-quantize e2
+    double sum = 0;
+    for (int i = 0; i < e1.length; i++) {
+      // Inverse of: ((value * 7.0) + 1.0) * 127.5
+      double e2Value = (((e2Quantized[i] / 127.5) - 1.0) / 7.0);
+      double diff = e1[i] - e2Value;
       sum += diff * diff;
     }
     return sqrt(sum);
+  }
+
+  String _generatePrivateKey(Uint8List quantized) {
+    return sha256.convert(quantized).toString();
   }
 
   double _calculateEmbeddingQuality(List<double> embedding) {
