@@ -19,27 +19,27 @@ class BiometricAuthService {
   }
 
   Future<FuzzyKey> enrollFromImage(img.Image faceImage) async {
-    final embedding = faceRecognitionService.predict(faceImage);
-    return fuzzyExtractorService.enroll(embedding);
+    final List<double> embedding = await faceRecognitionService.predict(faceImage);
+    return await fuzzyExtractorService.enroll(embedding);
   }
 
   Future<VerificationResult> verifyFromImage(
     img.Image faceImage,
     String publicSyndrome,
   ) async {
-    final embedding = faceRecognitionService.predict(faceImage);
-    return fuzzyExtractorService.verify(embedding, publicSyndrome);
+    final List<double> embedding = await faceRecognitionService.predict(faceImage);
+    return await fuzzyExtractorService.verify(embedding, publicSyndrome);
   }
 
   Future<FuzzyKey> enrollFromEmbedding(List<double> embedding) async {
-    return fuzzyExtractorService.enroll(embedding);
+    return await fuzzyExtractorService.enroll(embedding);
   }
 
   Future<VerificationResult> verifyFromEmbedding(
     List<double> embedding,
     String publicSyndrome,
   ) async {
-    return fuzzyExtractorService.verify(embedding, publicSyndrome);
+    return await fuzzyExtractorService.verify(embedding, publicSyndrome);
   }
 
   void dispose() {

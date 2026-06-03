@@ -26,11 +26,12 @@ class _CameraScreenState extends State<CameraScreen> {
     ),
   );
   bool _isBusy = false;
+  bool _isDisposed = false;
   CustomPaint? _customPaint;
   List<Face> _faces = [];
   CameraImage? _currentImage;
   DateTime _lastProcessTime = DateTime.now();
-  static const int _processIntervalMs = 300; // Process every 300ms
+  static const int _processIntervalMs = 500; // 2 FPS to reduce load
   bool _isEnrolled = false;
   
   // Smoothing bounding box
@@ -73,7 +74,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
     _cameraController = CameraController(
       frontCamera,
-      ResolutionPreset.high,
+      ResolutionPreset.medium,
       enableAudio: false,
       imageFormatGroup: Platform.isAndroid
           ? ImageFormatGroup.yuv420
@@ -81,18 +82,23 @@ class _CameraScreenState extends State<CameraScreen> {
     );
 
     await _cameraController?.initialize();
-    if (!mounted) return;
+    if (!mounted || _isDisposed) return;
 
     debugPrint('Camera initialized: ${_cameraController?.value.previewSize}');
 
     _cameraController?.startImageStream((image) {
+      if (_isDisposed || !mounted) return;
       _currentImage = image;
       _processCameraImage(image);
     });
-    setState(() {});
+    if (mounted && !_isDisposed) {
+      setState(() {});
+    }
   }
 
   Future<void> _processCameraImage(CameraImage image) async {
+    if (_isDisposed || !mounted) return;
+    
     final now = DateTime.now();
     if (_isBusy || now.difference(_lastProcessTime).inMilliseconds < _processIntervalMs) {
       return;
@@ -101,6 +107,7 @@ class _CameraScreenState extends State<CameraScreen> {
     _lastProcessTime = now;
 
     try {
+      if (_isDisposed || !mounted) return;
       final inputImage = _inputImageFromCameraImage(image);
       if (inputImage == null) {
         _isBusy = false;
@@ -133,7 +140,7 @@ class _CameraScreenState extends State<CameraScreen> {
         });
       }
     } catch (e) {
-      print("Error processing image: $e");
+      debugPrint("Error processing image: $e");
     } finally {
       _isBusy = false;
     }
@@ -208,29 +215,33 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() => _isBusy = true);
     
     try {
-      _showMessage('Enrollment: Averaging face samples...');
+      _showMessage('Enrollment: Capturing high-quality samples...');
       final int sensorOrientation = _cameraController!.description.sensorOrientation;
       final embeddings = <List<double>>[];
 
-      for (int i = 0; i < 5; i++) {
+      for (int i = 0; i < 15; i++) {
+        if (_isDisposed) break;
         if (_currentImage != null && _stableBox != null) {
-          final faceImg = _faceService.cropFace(_currentImage!, _faces.first, sensorOrientation);
+          final faceImg = await _faceService.cropFaceAsync(_currentImage!, _faces.first, sensorOrientation);
           if (faceImg != null) {
-            embeddings.add(_faceService.predict(faceImg));
+            final quality = await _faceService.estimateQualityAsync(faceImg);
+            debugPrint('Frame quality: ${quality.toStringAsFixed(2)}');
+            if (quality > 15.0) {
+              embeddings.add(await _faceService.predict(faceImg));
+            }
           }
         }
-        await Future.delayed(const Duration(milliseconds: 200));
+        if (embeddings.length >= 5) break;
+        await Future.delayed(const Duration(milliseconds: 100));
       }
 
-      if (embeddings.length < 3) throw Exception("Failed to capture enough face samples");
-
-      final avgEmbedding = List<double>.filled(512, 0.0);
-      for (final emb in embeddings) {
-        for (int j = 0; j < 512; j++) {
-          avgEmbedding[j] += emb[j] / embeddings.length;
-        }
+      if (_isDisposed) return;
+      if (embeddings.length < 3) {
+        throw Exception("Low quality face samples. Please ensure good lighting and hold steady.");
       }
-      final embedding = _faceService.l2Normalize(avgEmbedding);
+
+      final medianEmbedding = FuzzyExtractorService.medianEmbedding(embeddings);
+      final embedding = _faceService.l2Normalize(medianEmbedding);
       
       debugPrint('Enrollment: Fuzzy Extractor enrollment...');
       final fuzzyKey = await _fuzzyService.enroll(embedding);
@@ -281,44 +292,55 @@ class _CameraScreenState extends State<CameraScreen> {
       final int sensorOrientation = _cameraController!.description.sensorOrientation;
       final embeddings = <List<double>>[];
 
-      for (int i = 0; i < 5; i++) {
+      for (int i = 0; i < 15; i++) {
+        if (_isDisposed) break;
         if (_currentImage != null && _stableBox != null) {
-          final faceImg = _faceService.cropFace(_currentImage!, _faces.first, sensorOrientation);
+          final faceImg = await _faceService.cropFaceAsync(_currentImage!, _faces.first, sensorOrientation);
           if (faceImg != null) {
-            embeddings.add(_faceService.predict(faceImg));
+            final quality = await _faceService.estimateQualityAsync(faceImg);
+            if (quality > 15.0) {
+              embeddings.add(await _faceService.predict(faceImg));
+            }
           }
         }
-        await Future.delayed(const Duration(milliseconds: 150));
+        if (embeddings.length >= 5) break;
+        await Future.delayed(const Duration(milliseconds: 100));
       }
 
-      if (embeddings.length < 3) throw Exception("Failed to capture face samples");
-
-      final avgEmbedding = List<double>.filled(512, 0.0);
-      for (final emb in embeddings) {
-        for (int j = 0; j < 512; j++) {
-          avgEmbedding[j] += emb[j] / embeddings.length;
-        }
+      if (_isDisposed) return;
+      if (embeddings.length < 3) {
+        throw Exception("Low quality face samples. Please ensure good lighting.");
       }
-      final embedding = _faceService.l2Normalize(avgEmbedding);
+
+      final medianEmbedding = FuzzyExtractorService.medianEmbedding(embeddings);
+      final embedding = _faceService.l2Normalize(medianEmbedding);
 
       final result = await _fuzzyService.verify(embedding, userData['syndrome']);
 
-      if (result.success) {
-        await _blockchainService.verifyBio(userData['syndrome']);
-        
-        // Final calibration check: Distance < 0.8 is usually an excellent match
-        String matchQuality = result.embeddingDistance < 0.8 ? "High" : "Medium";
-
-        _showResultDialog(
-          title: 'Verification Success',
-          content: 'Identity confirmed via Blockchain.\n\n'
-                   'Match Quality: $matchQuality\n'
-                   'Confidence (Distance): ${result.embeddingDistance.toStringAsFixed(3)}\n'
-                   'Corrected Errors: ${result.correctedErrors}/127 per chunk',
-        );
+      if (result.success && result.recoveredKey != null) {
+        // PROVE the key by decrypting IPFS data
+        try {
+          final encryptedPayload = await _ipfsService.downloadData(userData['cid']);
+          _ipfsService.decryptPayload(encryptedPayload, result.recoveredKey!);
+          
+          // If we reach here, decryption succeeded!
+          await _blockchainService.verifyBio(userData['syndrome']);
+          
+          _showResultDialog(
+            title: 'Verification Success',
+            content: 'Identity confirmed via Blockchain & IPFS.\n\n'
+                     'Key Recovery: Stable\n'
+                     'Bit Errors Corrected: ${result.correctedErrors}/95\n'
+                     'Verification Time: ${result.verificationTimeMs}ms',
+          );
+        } catch (e) {
+          _showError('Verification failed: Face mismatch\n'
+                     'Reason: Key recovery succeeded but decryption failed.\n'
+                     'This happens if the face is very close but not the owner.');
+        }
       } else {
-        _showError('Verification failed: Face mismatch\n'
-                   'Distance: ${result.embeddingDistance.toStringAsFixed(3)}\n'
+        final errorMsg = result.errorMessage ?? 'Face mismatch';
+        _showError('Verification failed: $errorMsg\n'
                    'Hint: Try better lighting or center your face.');
       }
     } catch (e) {
@@ -358,6 +380,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
+    _isDisposed = true;
     _cameraController?.stopImageStream();
     _cameraController?.dispose();
     _faceDetector.close();
@@ -385,7 +408,7 @@ class _CameraScreenState extends State<CameraScreen> {
         fit: StackFit.expand,
         children: [
           CameraPreview(_cameraController!),
-          if (_customPaint != null) _customPaint!,
+          _customPaint ?? const SizedBox.shrink(),
           if (_isBusy) 
             Container(
               color: Colors.black45,

@@ -8,13 +8,13 @@ import '../models/fuzzy_key.dart';
 import '../utils/reed_solomon_new.dart';
 
 class FuzzyExtractorService {
-  static const int embeddingSize = 512; // Updated for FaceNet-512
-  static const int chunkSize = 128;
-  static const int paritySize = 127;
+  static const int embeddingSize = 512; 
+  static const int dataShards = 64;   // 512 bits = 64 bytes
+  static const int parityShards = 80;  // Corrects up to 40 byte errors
   late final ReedSolomon _rs;
 
   FuzzyExtractorService() {
-    _rs = ReedSolomon(dataShards: chunkSize, parityShards: paritySize);
+    _rs = ReedSolomon(dataShards: dataShards, parityShards: parityShards);
   }
 
   Future<FuzzyKey> enroll(List<double> embedding) async {
@@ -22,27 +22,20 @@ class FuzzyExtractorService {
       throw ArgumentError('Embedding должен быть размером $embeddingSize');
     }
 
-    final quantized = Uint8List.fromList(_quantizeEmbedding(embedding));
+    final binarized = _binarizeEmbedding(embedding);
     
-    // Split 512 into 4 chunks and encode each
-    final syndromes = <String>[];
-    for (int i = 0; i < 4; i++) {
-      final chunk = quantized.sublist(i * chunkSize, (i + 1) * chunkSize);
-      syndromes.add(base64Encode(_rs.encode(chunk)));
-    }
-    
-    final publicSyndrome = syndromes.join(':');
-    final privateKey = _generatePrivateKey(quantized);
+    final syndrome = base64Encode(_rs.encode(binarized));
+    final privateKey = _generatePrivateKey(binarized);
 
     final metadata = EnrollmentMetadata(
       enrollmentTime: DateTime.now(),
       framesCount: 1,
-      averageQuality: _calculateEmbeddingQuality(embedding),
-      algorithmVersion: 'FuzzyExtractor-RS-512-v1',
+      averageQuality: 0.0,
+      algorithmVersion: 'FuzzyExtractor-SignBinarization-RS255-v1',
     );
 
     return FuzzyKey(
-      publicSyndrome: publicSyndrome,
+      publicSyndrome: syndrome,
       privateKey: privateKey,
       enrollmentTime: metadata.enrollmentTime,
       metadata: metadata,
@@ -58,131 +51,92 @@ class FuzzyExtractorService {
     }
 
     final startTime = DateTime.now();
-    final newQuantized = Uint8List.fromList(_quantizeEmbedding(newEmbedding));
-    final syndromeChunks = publicSyndrome.split(':');
+    final newBinarized = _binarizeEmbedding(newEmbedding);
+    final parity = base64Decode(publicSyndrome);
 
-    if (syndromeChunks.length != 4) {
-      return VerificationResult(
+    if (parity.length != parityShards) {
+       return VerificationResult(
         success: false, correctedErrors: 0, 
-        verificationTimeMs: 0, errorMessage: 'Invalid syndrome format'
+        verificationTimeMs: 0, errorMessage: 'Invalid syndrome length'
       );
     }
 
-    final recoveredQuantized = Uint8List(embeddingSize);
-    int totalErrors = 0;
-    bool rsFailed = false;
-    String failureReason = '';
+    final codeword = Uint8List(dataShards + parityShards);
+    codeword.setRange(0, dataShards, newBinarized);
+    codeword.setRange(dataShards, codeword.length, parity);
 
-    try {
-      for (int i = 0; i < 4; i++) {
-        final parity = base64Decode(syndromeChunks[i]);
-        final chunk = newQuantized.sublist(i * chunkSize, (i + 1) * chunkSize);
-        
-        final codeword = Uint8List(chunkSize + paritySize);
-        codeword.setRange(0, chunkSize, chunk);
-        codeword.setRange(chunkSize, codeword.length, parity);
-
-        final recovered = _rs.decode(codeword);
-        if (recovered == null) {
-          rsFailed = true;
-          failureReason = 'Chunk $i mismatch';
-          break;
-        }
-        
-        recoveredQuantized.setRange(i * chunkSize, (i + 1) * chunkSize, recovered);
-        totalErrors += _countDifferences(chunk, recovered);
-      }
-    } catch (e) {
-      rsFailed = true;
-      failureReason = e.toString();
-    }
-
+    final recovered = _rs.decode(codeword);
     final verificationTimeMs = DateTime.now().difference(startTime).inMilliseconds;
 
-    // Even if RS fails, we want to know the distance for debugging
-    // We can't recover the original vector easily, but we can compute distance to what we have
-    // For now, let's return a special distance if RS fails, or implement a fallback distance check
-    
-    if (rsFailed) {
+    if (recovered == null) {
+      // If RS fails, we still want to report the Hamming distance for debugging
+      // (though it's harder to compute "distance" in embedding space from bits easily without bits->embedding)
+      // Actually, we can just return distance to newEmbedding if we had the original bits.
       return VerificationResult(
         success: false,
         recoveredKey: null,
         correctedErrors: -1,
-        embeddingDistance: 1.0, // This will be improved once we have helper data
+        embeddingDistance: double.nan,
         verificationTimeMs: verificationTimeMs,
-        errorMessage: 'Face mismatch: $failureReason',
+        errorMessage: 'Face mismatch (Too much noise). Please use better lighting.',
       );
     }
 
-    final recoveredKey = _generatePrivateKey(recoveredQuantized);
-    final distance = _calculateDistance(newEmbedding, recoveredQuantized);
+    final recoveredKey = _generatePrivateKey(recovered);
+    final errors = _countDifferences(newBinarized, recovered);
+    
+    // We don't have the original float embedding, but we can return the bit-error count as a metric
+    final bitDistance = errors / (dataShards * 8);
 
     return VerificationResult(
       success: true,
       recoveredKey: recoveredKey,
-      correctedErrors: totalErrors,
-      embeddingDistance: distance,
-      verificationTimeMs: DateTime.now().difference(startTime).inMilliseconds,
+      correctedErrors: errors,
+      embeddingDistance: bitDistance,
+      verificationTimeMs: verificationTimeMs,
     );
   }
 
-  /// Calculates real Euclidean distance for debugging
-  double calculateRawDistance(List<double> e1, List<double> e2) {
-    if (e1.length != e2.length) return 1.0;
-    double sum = 0;
-    for (int i = 0; i < e1.length; i++) {
-      double diff = e1[i] - e2[i];
-      sum += diff * diff;
-    }
-    return sqrt(sum);
-  }
-
-  List<int> _quantizeEmbedding(List<double> embedding) {
-    final result = <int>[];
-    for (final value in embedding) {
-      // Balanced Quantization for L2 FaceNet-512 vectors.
-      // L2 vectors have components mostly in [-0.2, 0.2].
-      // We use a gain of 7.0 to spread these values across the 0-255 byte range.
-      // Formula: ((value * Gain) + 1.0) * 127.5
-      // This increases sensitivity to facial details while allowing RS to correct noise.
-      final scaled = value * 7.0; 
-      final quantized = ((scaled + 1.0) * 127.5).round().clamp(0, 255);
-      result.add(quantized);
+  Uint8List _binarizeEmbedding(List<double> embedding) {
+    final result = Uint8List(dataShards);
+    for (int i = 0; i < embeddingSize; i++) {
+      if (embedding[i] > 0) {
+        final byteIdx = i >> 3;
+        final bitIdx = i & 7;
+        result[byteIdx] |= (1 << bitIdx);
+      }
     }
     return result;
   }
 
-  double _calculateDistance(List<double> e1, Uint8List e2Quantized) {
-    // To calculate real distance, we need to de-quantize e2
-    double sum = 0;
-    for (int i = 0; i < e1.length; i++) {
-      // Inverse of: ((value * 7.0) + 1.0) * 127.5
-      double e2Value = (((e2Quantized[i] / 127.5) - 1.0) / 7.0);
-      double diff = e1[i] - e2Value;
-      sum += diff * diff;
-    }
-    return sqrt(sum);
-  }
-
-  String _generatePrivateKey(Uint8List quantized) {
-    return sha256.convert(quantized).toString();
-  }
-
-  double _calculateEmbeddingQuality(List<double> embedding) {
-    final mean = embedding.reduce((a, b) => a + b) / embedding.length;
-    var variance = 0.0;
-    for (final value in embedding) {
-      variance += (value - mean) * (value - mean);
-    }
-    variance /= embedding.length;
-    return (sqrt(variance) / 1.0).clamp(0.0, 1.0).toDouble();
+  String _generatePrivateKey(Uint8List bits) {
+    return sha256.convert(bits).toString();
   }
 
   int _countDifferences(Uint8List a, Uint8List b) {
     var count = 0;
     for (var i = 0; i < a.length && i < b.length; i++) {
-      if (a[i] != b[i]) count++;
+      if (a[i] != b[i]) {
+        // Count bits
+        int xor = a[i] ^ b[i];
+        while (xor > 0) {
+          if (xor & 1 == 1) count++;
+          xor >>= 1;
+        }
+      }
     }
     return count;
+  }
+
+  /// Calculates component-wise median of multiple embeddings
+  static List<double> medianEmbedding(List<List<double>> embeddings) {
+    if (embeddings.isEmpty) return List.filled(embeddingSize, 0.0);
+    
+    final result = List<double>.filled(embeddingSize, 0.0);
+    for (int i = 0; i < embeddingSize; i++) {
+      final components = embeddings.map((e) => e[i]).toList()..sort();
+      result[i] = components[components.length ~/ 2];
+    }
+    return result;
   }
 }

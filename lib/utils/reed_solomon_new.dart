@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:math';
 
 /// Reed-Solomon codec over GF(256) using the primitive polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D).
 class ReedSolomon {
@@ -54,9 +55,10 @@ class ReedSolomon {
   }
 
   int _power(int a, int power) {
-    if (power == 0) return 1;
     if (a == 0) return 0;
-    return _expTable[(_logTable[a] * power) % 255];
+    if (power == 0) return 1;
+    int p = (power % 255 + 255) % 255;
+    return _expTable[(_logTable[a] * p) % 255];
   }
 
   Uint8List _polyMul(Uint8List a, Uint8List b) {
@@ -88,7 +90,7 @@ class ReedSolomon {
     for (int i = 0; i < dataShards; i++) {
       int coef = msg[i];
       if (coef != 0) {
-        for (int j = 0; j < _generator.length; j++) {
+        for (int j = 1; j < _generator.length; j++) {
           msg[i + j] ^= _multiply(coef, _generator[j]);
         }
       }
@@ -97,20 +99,18 @@ class ReedSolomon {
   }
 
   /// Decodes a codeword and attempts to correct errors.
-  /// Uses Berlekamp-Massey for error correction.
   Uint8List? decode(Uint8List codeword) {
     if (codeword.length != totalShards) {
       throw ArgumentError('Codeword length must be $totalShards');
     }
 
-    // 1. Calculate syndromes
     final syndromes = Uint8List(parityShards);
     bool hasError = false;
     for (int i = 0; i < parityShards; i++) {
       int s = 0;
       int x = _power(2, i);
       for (int j = 0; j < totalShards; j++) {
-        s = _multiply(s, x) ^ codeword[totalShards - 1 - j];
+        s = _multiply(s, x) ^ codeword[j];
       }
       syndromes[i] = s;
       if (s != 0) hasError = true;
@@ -118,7 +118,7 @@ class ReedSolomon {
 
     if (!hasError) return codeword.sublist(0, dataShards);
 
-    // 2. Berlekamp-Massey algorithm to find error locator polynomial
+    // Berlekamp-Massey
     Uint8List lambda = Uint8List.fromList([1]);
     Uint8List b = Uint8List.fromList([1]);
     int l = 0;
@@ -128,22 +128,23 @@ class ReedSolomon {
     for (int n = 0; n < parityShards; n++) {
       int d = syndromes[n];
       for (int i = 1; i <= l; i++) {
-        d ^= _multiply(lambda[lambda.length - 1 - i], syndromes[n - i]);
+        if (i < lambda.length) {
+          d ^= _multiply(lambda[lambda.length - 1 - i], syndromes[n - i]);
+        }
       }
 
       if (d == 0) {
         m++;
       } else {
         Uint8List oldLambda = Uint8List.fromList(lambda);
-        // lambda = lambda - d/b * x^m * b
         int factor = _divide(d, bInv);
+        
         Uint8List term = Uint8List(b.length + m);
         for (int i = 0; i < b.length; i++) {
           term[i] = _multiply(factor, b[i]);
         }
         
-        // Pad lambda and term to same size
-        int maxSize = lambda.length > term.length ? lambda.length : term.length;
+        int maxSize = max(lambda.length, term.length);
         Uint8List nextLambda = Uint8List(maxSize);
         for (int i = 0; i < lambda.length; i++) {
           nextLambda[maxSize - 1 - i] ^= lambda[lambda.length - 1 - i];
@@ -152,12 +153,11 @@ class ReedSolomon {
           nextLambda[maxSize - 1 - i] ^= term[term.length - 1 - i];
         }
         
-        // Trim leading zeros
         int firstNonZero = 0;
         while (firstNonZero < nextLambda.length && nextLambda[firstNonZero] == 0) {
           firstNonZero++;
         }
-        lambda = nextLambda.sublist(firstNonZero);
+        lambda = nextLambda.sublist(min(firstNonZero, nextLambda.length - 1));
 
         if (2 * l <= n) {
           l = n + 1 - l;
@@ -170,23 +170,22 @@ class ReedSolomon {
       }
     }
 
-    // 3. Find error locations (Chien search)
+    if (l > parityShards ~/ 2) return null; // Exceeds correction capacity
+
     final errorLocations = <int>[];
-    for (int i = 0; i < totalShards; i++) {
-      int xInv = _power(2, i);
+    for (int k = 0; k < totalShards; k++) {
+      int xInv = _power(2, k - (totalShards - 1));
       int eval = 0;
       for (int j = 0; j < lambda.length; j++) {
         eval ^= _multiply(lambda[lambda.length - 1 - j], _power(xInv, j));
       }
       if (eval == 0) {
-        errorLocations.add(totalShards - 1 - i);
+        errorLocations.add(k);
       }
     }
 
-    if (errorLocations.length != l) return null; // Too many errors
+    if (errorLocations.length != l) return null;
 
-    // 4. Forney algorithm for error values
-    // Calculate error evaluator polynomial Omega = Syndrome * Lambda mod x^parityShards
     Uint8List omega = Uint8List(parityShards);
     for (int i = 0; i < parityShards; i++) {
       for (int j = 0; j <= i && j < lambda.length; j++) {
@@ -194,7 +193,6 @@ class ReedSolomon {
       }
     }
 
-    // Formal derivative of Lambda
     Uint8List lambdaPrime = Uint8List(lambda.length - 1);
     for (int i = 1; i < lambda.length; i += 2) {
       lambdaPrime[lambdaPrime.length - i] = lambda[lambda.length - 1 - i];
@@ -203,8 +201,8 @@ class ReedSolomon {
     final correctedCodeword = Uint8List.fromList(codeword);
     for (int i = 0; i < errorLocations.length; i++) {
       int loc = errorLocations[i];
-      int x = _power(2, totalShards - 1 - loc);
-      int xInv = _inverse(x);
+      int xInv = _power(2, loc - (totalShards - 1));
+      int x = _inverse(xInv);
       
       int num = 0;
       for (int j = 0; j < omega.length; j++) {
@@ -216,8 +214,18 @@ class ReedSolomon {
         den ^= _multiply(lambdaPrime[lambdaPrime.length - 1 - j], _power(xInv, j));
       }
       
-      int errorValue = _divide(num, den);
+      int errorValue = _multiply(x, _divide(num, den));
       correctedCodeword[loc] ^= errorValue;
+    }
+
+    // Final check: syndromes must be zero for the corrected codeword
+    for (int i = 0; i < parityShards; i++) {
+      int s = 0;
+      int x = _power(2, i);
+      for (int j = 0; j < totalShards; j++) {
+        s = _multiply(s, x) ^ correctedCodeword[j];
+      }
+      if (s != 0) return null;
     }
 
     return correctedCodeword.sublist(0, dataShards);

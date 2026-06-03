@@ -3,61 +3,65 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:biovault_id/services/fuzzy_extractor_service.dart';
 
 void main() {
-  group('FuzzyExtractorService Stability', () {
+  group('FuzzyExtractorService Binarization Stability', () {
     late FuzzyExtractorService service;
 
     setUp(() {
       service = FuzzyExtractorService();
     });
 
-    test('Verification succeeds with moderate noise (0.05 drift)', () async {
-      // Create a 512-dim embedding (L2 normalized)
+    test('Verification succeeds with moderate bit flips (30 bits)', () async {
       final rand = Random(42);
-      final embedding = List<double>.generate(512, (_) => rand.nextDouble() * 2 - 1);
-      final norm = sqrt(embedding.fold(0.0, (sum, e) => sum + e * e));
-      final normalized = embedding.map((e) => e / norm).toList();
-
+      final normalized = List.generate(512, (_) => rand.nextDouble() * 2 - 1);
       final fuzzyKey = await service.enroll(normalized);
 
-      // Add 0.05 noise (typical for bad lighting)
-      final noisyEmbedding = normalized.map((e) => (e + 0.03).clamp(-1.0, 1.0)).toList();
+      final noisyEmbedding = List<double>.from(normalized);
+      final indices = List.generate(512, (i) => i)..shuffle(rand);
+      for (int i = 0; i < 30; i++) {
+        noisyEmbedding[indices[i]] = -normalized[indices[i]];
+      }
+
       final result = await service.verify(noisyEmbedding, fuzzyKey.publicSyndrome);
 
-      print('Corrected errors with 0.03 noise: ${result.correctedErrors}');
-      expect(result.success, isTrue, reason: 'Should succeed with 0.03 noise');
+      print('Corrected bit errors (30 flips): ${result.correctedErrors}');
+      expect(result.success, isTrue);
       expect(result.recoveredKey, equals(fuzzyKey.privateKey));
     });
 
-    test('Median embedding is robust to outliers', () {
-      final e1 = List<double>.filled(512, 0.1);
-      final e2 = List<double>.filled(512, 0.11);
-      final outlier = List<double>.filled(512, 0.9); // Huge outlier
+    test('Verification fails with too many bit flips (200 bits)', () async {
+      final rand = Random(42);
+      final normalized = List.generate(512, (_) => rand.nextDouble() * 2 - 1);
+      final fuzzyKey = await service.enroll(normalized);
 
-      final median = FuzzyExtractorService.medianEmbedding([e1, e2, outlier]);
-      
-      // Median of [0.1, 0.11, 0.9] is 0.11
-      expect(median[0], closeTo(0.11, 0.001));
-      expect(median[511], closeTo(0.11, 0.001));
+      final noisyEmbedding = List<double>.from(normalized);
+      final indices = List.generate(512, (i) => i)..shuffle(rand);
+      for (int i = 0; i < 200; i++) {
+        noisyEmbedding[indices[i]] = -normalized[indices[i]];
+      }
+
+      final result = await service.verify(noisyEmbedding, fuzzyKey.publicSyndrome);
+      expect(result.success, isFalse);
     });
-    
-    test('RS failure returns NaN distance and specific error', () async {
-       final rand = Random(42);
-       final e1 = List<double>.generate(512, (_) => rand.nextDouble() * 2 - 1);
-       final norm1 = sqrt(e1.fold(0.0, (sum, e) => sum + e * e));
-       final n1 = e1.map((e) => e / norm1).toList();
 
-       final fuzzyKey = await service.enroll(n1);
+    test('Median embedding with binarization', () async {
+      final rand = Random(42);
+      final base = List.generate(512, (_) => rand.nextDouble() * 2 - 1);
+      
+      final samples = List.generate(5, (s) {
+        final sample = List<double>.from(base);
+        for (int i = 0; i < 40; i++) {
+          int idx = rand.nextInt(512);
+          sample[idx] = -base[idx];
+        }
+        return sample;
+      });
 
-       // Completely different random vector
-       final e2 = List<double>.generate(512, (_) => rand.nextDouble() * 2 - 1);
-       final norm2 = sqrt(e2.fold(0.0, (sum, e) => sum + e * e));
-       final n2 = e2.map((e) => e / norm2).toList();
-
-       final result = await service.verify(n2, fuzzyKey.publicSyndrome);
-
-       expect(result.success, isFalse);
-       expect(result.embeddingDistance.isNaN, isTrue);
-       expect(result.errorMessage, contains('Too much noise'));
+      final median = FuzzyExtractorService.medianEmbedding(samples);
+      
+      final fuzzyKey = await service.enroll(base);
+      final result = await service.verify(median, fuzzyKey.publicSyndrome);
+      
+      expect(result.success, isTrue);
     });
   });
 }
